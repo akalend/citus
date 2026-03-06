@@ -130,89 +130,209 @@ Function `JobExecutorType()` detects and returns `MULTI_ONE_TASK_ADAPTIVE_EXECUT
 
 ### 5.3 Optimized Execution Path
 
-Instead of a DistributedExecution, the OneTaskAdaptiveExcecutor is driven by a OneTaskExecution:
-```
-Typedef struct OneTaskExec 
-{
-	RowModifyLevel modLevel;	
-	Task *task; // the task for the execution
-	TupleDestination *defaultTupleDest; // Used when task destination not spec
-	ParamListInfo paramListInfo; // For paramd plans. Can be null.
-	Worker *worker; // Worker involved; NULL => Local execution
-	Session *session; // Connection; NULL => Local execution
-	bool rebuildWaitEventSet; // connection we are interested in has changed
-	bool waitFlagsChanged; // wait events we are interested in has changed
-
-	allocatedColumnCount;
-	columnArray;		// can be initialized directly from the shard query
-} OneTaskExec;
-```
-
-We can also have data structures for single worker and single session to simplify execution:
-```
-Worker	// Session on a worker
-{
-	OneTaskExec *myExecution;
-	char *nodeName;
-	int nodePort;
-
-	Session *session;
-	bool isActive; // true => connection established; 
-
-	TaskPlacementExecution *myTask;
-	ENUM_TYPE	taskState; // not_assigned; conn_assigned; 
-
-	bool workerToLocalNode; // true => worker is for local node
-
-}	
-
-Session
-{
-	Worker *myWorker;
-	TaskPlacementExecution *myTask;
-  // other fields as needed
-}
-```
+`CitusExecOneTaskScan()` is the entry point. It falls back to `AdaptiveExecutor()` for EXPLAIN ANALYZE (which needs per-task cost annotations), otherwise calls `OneTaskAdaptiveExecutor()`:
 
 ```
-CitusExecOneTaskScan()
-  └─ OneTaskAdaptiveExecutor(scanState)
-       ├─ tuplestore_begin_heap()                    ← allocate result store
-       ├─ CreateTupleStoreTupleDest()
-       ├─ DecideTaskTransactionProperties()      ← determine 2PC, txn blocks
-       ├─ copyParamList() + MarkUnreferencedExternParams()
-       ├─ CreateOneTaskExecution()               ← allocate one task DistributedExecution
-       │    ├─ palloc0 column arrays according to the query results descriptor
-       │    ├─ ShouldExecuteTaskLocally()           ← Determine if Task is local or remote
-       │    
-       
-       If task is remote:
-       ├─ StartOneTaskDistributedExecution()   ← coordinated txn, shard locks; refactor of StartDistributedExecution()
-       ├─ RunOneTaskDistributedExecution()     ← Refactor of RunDistributedExecution() for one task
-       │    ├─ AssignTaskToConnectionsOrWorkerPool()
-       │    │    ├─ alloc ShardCommandExecution
-       │    │    ├─ alloc TaskPlacementExecution if needed
-       │    │    ├─ FindOrCreateWorker()   ← refactor of FindOrCreateWorkerPool() that assumes one task, one worker, one session
-       │    │    
-       │    ├─ ManageWorkerPool()                    ← slow-start, open connections
-       │    │    └─ StartNodeUserDatabaseConnection()
-       │    ├─ BuildWaitEventSet()                   ← palloc + AddWaitEventToSet
-       │    └─ while (unfinishedTaskCount > 0):
-       │         WaitEventSetWait()
-       │         ProcessWaitEvents()
-       │         ConnectionStateMachine()
-       │           └─ TransactionStateMachine()
-       │                ├─ send BEGIN (if txn block)
-       │                ├─ send query
-       │                └─ ReceiveResults() → tuplestore
-       ├─ FinishDistributedExecution()
-       
-       If task is local:
-       ├─ RunOneTaskLocalExecution()
-       |  |─ Refactor of LocalExecution() for one task
-
-       └─ SortTupleStore() (if RETURNING + ORDER BY)
+CitusExecOneTaskScan(node)
+  ├─ if RequestedForExplainAnalyze(scanState) → AdaptiveExecutor(scanState)  ← fallback
+  └─ else → OneTaskAdaptiveExecutor(scanState)
+  └─ IncrementStatCounterForMyDb(STAT_QUERY_EXECUTION_SINGLE_SHARD)
+  └─ ReturnTupleFromTuplestore(scanState)
 ```
+
+The full flow of `OneTaskAdaptiveExecutor(scanState)`:
+
+```
+OneTaskAdaptiveExecutor(scanState)
+  │
+  ├─── Phase 1: Setup ───────────────────────────────────────────────────────
+  │  AllocSetContextCreate("OneTaskAdaptiveExecutor")
+  │  tuplestore_begin_heap()                          ← result store
+  │  CreateTupleStoreTupleDest()
+  │
+  ├─── Phase 2: Transaction Properties & Parameters ─────────────────────────
+  │  DecideTaskListTransactionProperties(modLevel, taskList)
+  │    → determines useRemoteTransactionBlocks:
+  │        REQUIRED  — if modifying data, or inside coordinated txn
+  │        ALLOWED   — if read-only, outside explicit txn
+  │        DISALLOWED — if excludeFromTransaction or CREATE INDEX CONCURRENTLY
+  │    → determines requires2PC:
+  │        true if multi-shard write across nodes, or reference table modification
+  │  if (paramListInfo != NULL && !paramListInfo->paramFetch):
+  │    copyParamList()
+  │    MarkUnreferencedExternParams()
+  │
+  ├─── Phase 3: Coordinated Transaction & Locks ─────────────────────────────
+  │  if useRemoteTransactionBlocks == REQUIRED:
+  │    UseCoordinatedTransaction()
+  │  if requires2PC:
+  │    Use2PCForCoordinatedTransaction()
+  │  AcquireExecutorShardLocksForExecution(modLevel, taskList)
+  │
+  ├─── Phase 4: Zero-Task Short Circuit ─────────────────────────────────────
+  │  if taskList == NIL:
+  │    goto finish                                    ← nothing to execute
+  │
+  ├─── Phase 5: Local vs. Remote Split ──────────────────────────────────────
+  │  if ShouldExecuteTasksLocally(taskList):
+  │    ExtractLocalAndRemoteTasks()
+  │      → localTaskList, remoteTaskList
+  │  else:
+  │    remoteTaskList = taskList
+  │
+  ├─── Phase 6: Local Execution (if local) ──────────────────────────────────
+  │  if localTaskList != NIL:
+  │    ExecuteLocalTaskListExtended(localTaskList, ...)
+  │      → uses PG local executor (ExecutorStart/Run)
+  │      → results go into same tuplestore
+  │      → es_processed updated for DML
+  │    (skip to Phase 8)
+  │
+  ├─── Phase 7: Remote Execution (the core optimization) ───────────────────
+  │  │
+  │  ├─ 7a. Placement Lookup
+  │  │    task = linitial(remoteTaskList)
+  │  │    taskPlacement = linitial(task->taskPlacementList)
+  │  │    LookupTaskPlacementHostAndPort() → nodeName, nodePort
+  │  │
+  │  ├─ 7b. Connection Acquisition
+  │  │    placementAccessList = PlacementAccessListForTask(task, taskPlacement)
+  │  │    if useRemoteTransactionBlocks != DISALLOWED:
+  │  │      connection = GetConnectionIfPlacementAccessedInXact(...)
+  │  │                   ↑ reuse connection from earlier in same txn
+  │  │    if connection == NULL:
+  │  │      connection = GetNodeUserDatabaseConnection(nodeName, nodePort)
+  │  │      if PQstatus != CONNECTION_OK → ereport(ERROR)
+  │  │
+  │  ├─ 7c. Dead Connection Detection (cached connections only)
+  │  │    if remoteTransaction.transactionState == REMOTE_TRANS_NOT_STARTED:
+  │  │      sock = PQsocket(connection->pgConn)
+  │  │      peekRc = recv(sock, &peekBuf, 1, MSG_PEEK | MSG_DONTWAIT)
+  │  │        peekRc == 0        → EOF, remote closed         → dead
+  │  │        peekRc > 0         → unexpected data (FATAL)    → dead
+  │  │        errno != EAGAIN    → socket error               → dead
+  │  │        errno == EAGAIN    → nothing pending             → alive
+  │  │      if dead:
+  │  │        CloseConnection(connection)
+  │  │        connection = GetNodeUserDatabaseConnection(...)  ← one retry
+  │  │
+  │  ├─ 7d. Claim & Track
+  │  │    ClaimConnectionExclusively(connection)
+  │  │    AssignPlacementListToConnection(placementAccessList, connection)
+  │  │
+  │  ├─ 7e. 2PC for Expanded Transactions
+  │  │    if TRANSACTION_BLOCKS_REQUIRED
+  │  │       && XactModificationLevel == XACT_MODIFICATION_DATA
+  │  │       && TaskListModifiesDatabase(...)
+  │  │       && !ConnectionModifiedPlacement(connection):
+  │  │      Use2PCForCoordinatedTransaction()
+  │  │
+  │  ├─ 7f. BEGIN Remote Transaction
+  │  │    if useRemoteTransactionBlocks == REQUIRED:
+  │  │      RemoteTransactionBeginIfNecessary(connection)     ← sends BEGIN
+  │  │
+  │  ├─ 7g. Send Query
+  │  │    queryString = TaskQueryStringAtIndex(task, 0)
+  │  │    binaryResults = EnableBinaryProtocol && CanUseBinaryCopyFormat(tupleDesc)
+  │  │    if paramListInfo && !task->parametersInQueryStringResolved:
+  │  │      ExtractParametersForRemoteExecution(...)
+  │  │      SendRemoteCommandParams(connection, queryString, params, binaryResults)
+  │  │    else:
+  │  │      SendRemoteCommand(connection, queryString)        ← text mode
+  │  │      (or SendRemoteCommandParams with binaryResults)   ← binary mode
+  │  │    if querySent == 0 → ereport(ERROR)
+  │  │
+  │  ├─ 7h. Enable Single-Row Mode
+  │  │    PQsetSingleRowMode(connection->pgConn)
+  │  │    if fails → UnclaimConnection(), ereport(ERROR)
+  │  │
+  │  ├─ 7i. Build Result Metadata
+  │  │    if tupleDescriptor != NULL:
+  │  │      attInMetadata = binaryResults
+  │  │        ? TupleDescGetAttBinaryInMetadata(tupleDesc)
+  │  │        : TupleDescGetAttInMetadata(tupleDesc)
+  │  │    columnArray = palloc0(columnCount * sizeof(void *))
+  │  │    if binaryResults:
+  │  │      stringInfoDataArray = palloc0(columnCount * sizeof(StringInfoData))
+  │  │
+  │  ├─ 7j. Result Loop (simple poll — no WaitEventSet, no state machines)
+  │  │    rowContext = AllocSetContextCreate("RowContext")
+  │  │    while (!fetchDone):
+  │  │      │
+  │  │      ├─ if PQisBusy(connection):
+  │  │      │    WaitLatchOrSocket(MyLatch,
+  │  │      │      WL_SOCKET_READABLE | WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
+  │  │      │      sock, 0, PG_WAIT_EXTENSION)
+  │  │      │    ResetLatch(MyLatch)
+  │  │      │    CHECK_FOR_INTERRUPTS()
+  │  │      │    if socket readable: PQconsumeInput()
+  │  │      │    continue
+  │  │      │
+  │  │      ├─ result = PQgetResult(connection)
+  │  │      │    result == NULL → fetchDone = true; break
+  │  │      │
+  │  │      ├─ switch PQresultStatus(result):
+  │  │      │    PGRES_COMMAND_OK    → rowsProcessed += PQcmdTuples; continue
+  │  │      │    PGRES_TUPLES_OK    → final marker after single-row mode; continue
+  │  │      │    PGRES_SINGLE_TUPLE → process rows (below)
+  │  │      │    other              → ReportResultError(connection, result, ERROR)
+  │  │      │
+  │  │      └─ for each row in result:
+  │  │           MemoryContextSwitchTo(rowContext)
+  │  │           build columnArray from PQgetvalue / PQgetisnull
+  │  │           heapTuple = binaryResults
+  │  │             ? BuildTupleFromBytes(attInMetadata, columnArray)
+  │  │             : BuildTupleFromCStrings(attInMetadata, columnArray)
+  │  │           tupleDest->putTuple(tupleDest, task, heapTuple)
+  │  │           MemoryContextReset(rowContext)
+  │  │           rowsProcessed++
+  │  │
+  │  │    MemoryContextDelete(rowContext)
+  │  │
+  │  └─ 7k. Release Connection & Count Rows
+  │       UnclaimConnection(connection)
+  │       if commandType != CMD_SELECT:
+  │         es_processed += rowsProcessed
+  │
+  ├─── Phase 8: Finish ─────────────────────────────────────────────────────
+  │  finish:
+  │  if TaskListModifiesDatabase(modLevel, taskList):
+  │    XactModificationLevel = XACT_MODIFICATION_DATA
+  │  MemoryContextSwitchTo(oldContext)
+  │  return NULL                                      ← results in tuplestore
+  │
+  └─── (COMMIT/ROLLBACK of remote txn handled by coordinator at txn end)
+```
+
+**Key differences from `AdaptiveExecutor()` (section 4.1):**
+
+| Aspect | AdaptiveExecutor | OneTaskAdaptiveExecutor |
+|---|---|---|
+| Struct allocation | `DistributedExecution`, `WorkerPool`, `WorkerSession`, `ShardCommandExecution`, `TaskPlacementExecution` | None of these — direct variables |
+| Event loop | `WaitEventSet` + `BuildWaitEventSet` + `ProcessWaitEvents` | `WaitLatchOrSocket()` on a single socket |
+| Connection management | `FindOrCreateWorkerPool` → linear scan, `SortList`, slow-start | Direct `GetNodeUserDatabaseConnection` or in-txn reuse |
+| State machines | `ConnectionStateMachine` + `TransactionStateMachine` (multi-state FSM) | Linear sequential flow — no state tracking |
+| Dead connection handling | Implicit via state machine retries and pool management | Explicit `recv(MSG_PEEK)` probe + one retry |
+| EXPLAIN ANALYZE | Inline, with per-task annotations | Falls back to full `AdaptiveExecutor` |
+| Dependent jobs | `ExecuteDependentTasks()` before main execution | Not supported (ineligible by design) |
+| Multi-row INSERT | Supported | Ineligible (detected by `JobExecutorType`) |
+
+**Edge cases within the execution flow:**
+
+| Scenario | Behavior |
+|---|---|
+| Zero tasks (empty taskList after pruning) | Short-circuits at Phase 4, no connection opened |
+| Local shard (shard on coordinator) | Handled in Phase 6 via `ExecuteLocalTaskListExtended`; no remote connection |
+| Explicit transaction block (`BEGIN...COMMIT`) | `useRemoteTransactionBlocks = REQUIRED`; BEGIN sent in 7f; same connection reused for subsequent statements; COMMIT at txn end |
+| Prepared statement / parameterized query | Parameters extracted in 7g via `ExtractParametersForRemoteExecution`; sent with `SendRemoteCommandParams` |
+| RETURNING clause on DML | Results processed like SELECT rows in 7j; rowsProcessed also counted from `PQcmdTuples` |
+| Binary protocol eligible | Detected in 7g; binary metadata built in 7i; `BuildTupleFromBytes` in 7j |
+| Cached connection found dead | Detected in 7c via non-blocking `recv(MSG_PEEK)`; closed and retried once. If retry also fails, `ereport(ERROR)` |
+| Connection failure (new connection) | `ereport(ERROR)` immediately — no fallback to other placements or to `AdaptiveExecutor` |
+| Query send failure | `ereport(ERROR)` after `UnclaimConnection` |
+| Remote error during result fetch | `ReportResultError(connection, result, ERROR)` — same error as `AdaptiveExecutor` |
+| Shard moved / split (shard absent) | Executor errors out — shard existence is assumed from planner |
+| Cancel / interrupt | `CHECK_FOR_INTERRUPTS()` in result loop; standard PG cancellation |
 
 ### 5.4 Connection Handling
 
